@@ -1,0 +1,91 @@
+name: Square Era Room Server Supervisor
+
+on:
+  schedule:
+    - cron: '0 */5 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-room-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Server Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Restore Latest World from Database Repository
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          echo "Restoring world snapshot from yasamarium/square-era-db-room5..."
+          mkdir -p data
+          curl -s -H "Authorization: token $GH_PAT" \
+            https://raw.githubusercontent.com/yasamarium/square-era-db-room5/main/data/world.json -o data/world.json || true
+          curl -s -H "Authorization: token $GH_PAT" \
+            https://raw.githubusercontent.com/yasamarium/square-era-db-room5/main/data/players.json -o data/players.json || true
+          curl -s -H "Authorization: token $GH_PAT" \
+            https://raw.githubusercontent.com/yasamarium/square-era-db-room5/main/data/chat.json -o data/chat.json || true
+          echo "World snapshot restored."
+
+      - name: Run Room Server Daemon (4h50m Managed Cycle)
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          PORT: 8080
+        run: |
+          echo "========================================================"
+          echo " Starting Square Era Room Server Daemon: Room 5 (Anarchy Wilds)"
+          echo " 5-Hour Managed Supervisor Cycle"
+          echo "========================================================"
+          node server.js &
+          SERVER_PID=$!
+          echo "Server daemon running with PID $SERVER_PID"
+
+          # 4 hours 50 minutes (17400s)
+          sleep 17400
+
+          echo "Cycle boundary reached. Retriggering successor workflow..."
+          node scripts/retrigger.js || echo "Retrigger completed or scheduled."
+
+          echo "Gracefully terminating server daemon..."
+          kill -TERM $SERVER_PID || true
+          wait $SERVER_PID 2>/dev/null || true
+
+      - name: Commit & Shift Accumulated Data to Database Repository
+        if: always()
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          echo "========================================================"
+          echo " Committing and shifting world state to square-era-db-room5..."
+          echo "========================================================"
+          git config --global user.name "SquareEra-SyncBot"
+          git config --global user.email "syncbot@squareera.local"
+
+          git clone https://${GH_PAT}@github.com/yasamarium/square-era-db-room5.git db_repo
+          mkdir -p db_repo/data
+
+          if [ -f data/world.json ]; then
+            cp -f data/world.json db_repo/data/world.json
+          fi
+          if [ -f data/players.json ]; then
+            cp -f data/players.json db_repo/data/players.json
+          fi
+          if [ -f data/chat.json ]; then
+            cp -f data/chat.json db_repo/data/chat.json
+          fi
+
+          cd db_repo
+          git add data/
+          if git diff-index --quiet HEAD --; then
+            echo "No world modifications in this cycle. DB already in sync."
+          else
+            git commit -m "Auto-sync world modifications and player state [Cycle $(date -u +'%Y-%m-%d %H:%M:%S UTC')]"
+            git push origin main
+            echo "World modifications committed and pushed to database repo successfully!"
+          fi
