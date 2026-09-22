@@ -1,0 +1,10 @@
+{
+  "name": "square-era-server-room5",
+  "version": "1.0.0",
+  "description": "Square Era 5-Hour Managed Multiplayer Room Server for Room 5 (Anarchy Wilds)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "retrigger": "node scripts/retrigger.js"
+  }
+}
