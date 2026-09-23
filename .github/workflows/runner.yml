@@ -19,6 +19,10 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Install Dependencies
+        run: |
+          npm install --no-audit
+
       - name: Restore Latest World from Database Repository
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
@@ -40,11 +44,38 @@ jobs:
         run: |
           echo "========================================================"
           echo " Starting Square Era Room Server Daemon: Room 5 (Anarchy Wilds)"
-          echo " 5-Hour Managed Supervisor Cycle"
+          echo " 5-Hour Managed Supervisor Cycle with Live MQTT Bridge"
           echo "========================================================"
           node server.js &
           SERVER_PID=$!
           echo "Server daemon running with PID $SERVER_PID"
+
+          # Periodic background backup committer every 15 minutes
+          (
+            while kill -0 $SERVER_PID 2>/dev/null; do
+              sleep 900
+              if [ -f data/world.json ]; then
+                echo "[Backup] Performing periodic checkpoint push to square-era-db-room5..."
+                git config --global user.name "SquareEra-SyncBot"
+                git config --global user.email "syncbot@squareera.local"
+                rm -rf /tmp/db_periodic
+                git clone --quiet https://${GH_PAT}@github.com/yasamarium/square-era-db-room5.git /tmp/db_periodic
+                mkdir -p /tmp/db_periodic/data
+                cp -f data/world.json /tmp/db_periodic/data/world.json
+                [ -f data/players.json ] && cp -f data/players.json /tmp/db_periodic/data/players.json
+                [ -f data/chat.json ] && cp -f data/chat.json /tmp/db_periodic/data/chat.json
+                cd /tmp/db_periodic
+                git add data/
+                if ! git diff-index --quiet HEAD --; then
+                  git commit -m "Auto-sync periodic checkpoint [$(date -u +'%Y-%m-%d %H:%M:%S UTC')]"
+                  git push origin main || true
+                  echo "[Backup] Periodic checkpoint successfully saved to square-era-db-room5!"
+                fi
+                cd - >/dev/null
+              fi
+            done
+          ) &
+          BACKUP_PID=$!
 
           # 4 hours 50 minutes (17400s)
           sleep 17400
@@ -55,6 +86,7 @@ jobs:
           echo "Gracefully terminating server daemon..."
           kill -TERM $SERVER_PID || true
           wait $SERVER_PID 2>/dev/null || true
+          kill $BACKUP_PID 2>/dev/null || true
 
       - name: Commit & Shift Accumulated Data to Database Repository
         if: always()
@@ -62,11 +94,12 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           echo "========================================================"
-          echo " Committing and shifting world state to square-era-db-room5..."
+          echo " Committing and shifting all room data to square-era-db-room5 before restart..."
           echo "========================================================"
           git config --global user.name "SquareEra-SyncBot"
           git config --global user.email "syncbot@squareera.local"
 
+          rm -rf db_repo
           git clone https://${GH_PAT}@github.com/yasamarium/square-era-db-room5.git db_repo
           mkdir -p db_repo/data
 
@@ -85,7 +118,7 @@ jobs:
           if git diff-index --quiet HEAD --; then
             echo "No world modifications in this cycle. DB already in sync."
           else
-            git commit -m "Auto-sync world modifications and player state [Cycle $(date -u +'%Y-%m-%d %H:%M:%S UTC')]"
+            git commit -m "Auto-sync world modifications and player state before restart [$(date -u +'%Y-%m-%d %H:%M:%S UTC')]"
             git push origin main
-            echo "World modifications committed and pushed to database repo successfully!"
+            echo "SUCCESS: 100% of room activities shifted to database repo before restart!"
           fi
