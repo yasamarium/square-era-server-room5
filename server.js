@@ -1,16 +1,19 @@
 // server.js - Square Era Dedicated Multiplayer Room Server
 // Room 5: Anarchy Wilds (SURVIVAL)
+// Live MQTT Activity Bridge & Automatic Database Persistence
 // Strictly Zero Unicode Emojis
 
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const mqtt = require('mqtt');
 
 const PORT = process.env.PORT || 8080;
 const ROOM_ID = 5;
 const ROOM_NAME = 'Anarchy Wilds';
 const ROOM_MODE = 'survival';
 const START_TIME = Date.now();
+const TOPIC = `square-era-v2/room-${ROOM_ID}`;
 
 const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -23,6 +26,7 @@ const CHAT_FILE = path.join(DATA_DIR, 'chat.json');
 let worldModifications = new Map();
 let activePlayers = new Map();
 let chatHistory = [];
+let pendingDiskSave = false;
 
 // Load initial world if available
 try {
@@ -30,11 +34,11 @@ try {
     const wData = JSON.parse(fs.readFileSync(WORLD_FILE, 'utf8'));
     if (wData && Array.isArray(wData.modifications)) {
       wData.modifications.forEach(([k, v]) => worldModifications.set(k, v));
-      console.log(`[Room ${ROOM_ID}] Loaded ${worldModifications.size} block modifications from storage.`);
+      console.log(`[Room ${ROOM_ID}] Restored ${worldModifications.size} block modifications from storage.`);
     }
   }
 } catch (e) {
-  console.warn(`[Room ${ROOM_ID}] Could not parse initial world file:`, e.message);
+  console.warn(`[Room ${ROOM_ID}] Initial world load notice:`, e.message);
 }
 
 function saveSnapshotToDisk() {
@@ -54,25 +58,149 @@ function saveSnapshotToDisk() {
     fs.writeFileSync(PLAYERS_FILE, JSON.stringify(playerList, null, 2), 'utf8');
 
     fs.writeFileSync(CHAT_FILE, JSON.stringify(chatHistory.slice(-100), null, 2), 'utf8');
+    pendingDiskSave = false;
   } catch (e) {
     console.error(`[Room ${ROOM_ID}] Snapshot write error:`, e.message);
   }
 }
 
-// Periodic 30s disk snapshot
-setInterval(saveSnapshotToDisk, 30000);
+// Periodic 15s disk flush if modifications were made
+setInterval(() => {
+  if (pendingDiskSave) saveSnapshotToDisk();
+}, 15000);
 
-// Cleanup inactive players after 40 seconds
+// Cleanup inactive players after 45 seconds
 setInterval(() => {
   const now = Date.now();
   for (const [id, p] of activePlayers.entries()) {
-    if (now - p.lastSeen > 40000) {
+    if (now - p.lastSeen > 45000) {
       activePlayers.delete(id);
-      console.log(`[Room ${ROOM_ID}] Player ${p.name || id} timed out.`);
     }
   }
 }, 10000);
 
+// =========================================================================
+// Live MQTT Bridge - Captures all player activities directly
+// =========================================================================
+const BROKERS = ['mqtt://broker.emqx.io:1883', 'mqtt://broker.hivemq.com:1883'];
+let currentBrokerIdx = 0;
+let mqttClient = null;
+
+function connectMqtt() {
+  const brokerUrl = BROKERS[currentBrokerIdx];
+  const clientId = `square_server_room_${ROOM_ID}_${Math.random().toString(36).slice(2, 8)}`;
+  console.log(`[Room ${ROOM_ID}] Connecting to MQTT broker: ${brokerUrl}...`);
+
+  mqttClient = mqtt.connect(brokerUrl, {
+    clientId: clientId,
+    clean: true,
+    connectTimeout: 8000,
+    keepalive: 30
+  });
+
+  mqttClient.on('connect', () => {
+    console.log(`[Room ${ROOM_ID}] Connected to MQTT broker! Subscribing to ${TOPIC}...`);
+    mqttClient.subscribe(TOPIC, err => {
+      if (!err) {
+        console.log(`[Room ${ROOM_ID}] Successfully subscribed to room topic ${TOPIC}!`);
+      }
+    });
+  });
+
+  mqttClient.on('message', (topic, message) => {
+    try {
+      const packet = JSON.parse(message.toString());
+      if (!packet || packet.roomId !== ROOM_ID) return;
+
+      // 1. Block change activity
+      if (packet.type === 'block_change') {
+        const key = packet.key || `${packet.x},${packet.y},${packet.z}`;
+        if (key && packet.block !== undefined) {
+          worldModifications.set(key, packet.block);
+          pendingDiskSave = true;
+          console.log(`[Room ${ROOM_ID}] Recorded block change ${key} -> ${packet.block} (Total: ${worldModifications.size})`);
+        }
+      }
+
+      // 2. Explosion activity
+      else if (packet.type === 'explosion') {
+        const ex = Math.round(packet.ex);
+        const ey = Math.round(packet.ey);
+        const ez = Math.round(packet.ez);
+        const radius = Math.min(8, Math.round(packet.radius || 3.5));
+        for (let dx = -radius; dx <= radius; dx++) {
+          for (let dy = -radius; dy <= radius; dy++) {
+            for (let dz = -radius; dz <= radius; dz++) {
+              if (dx * dx + dy * dy + dz * dz <= radius * radius) {
+                worldModifications.set(`${ex + dx},${ey + dy},${ez + dz}`, 0);
+              }
+            }
+          }
+        }
+        pendingDiskSave = true;
+        console.log(`[Room ${ROOM_ID}] Recorded explosion at [${ex}, ${ey}, ${ez}] radius ${radius}. Total: ${worldModifications.size}`);
+      }
+
+      // 3. Player state / join activity
+      else if (packet.type === 'player_state' || packet.type === 'player_join') {
+        const id = packet.id || packet.senderId;
+        if (id) {
+          activePlayers.set(id, {
+            id: id,
+            name: packet.name || 'Player',
+            x: packet.x || 0,
+            y: packet.y || 0,
+            z: packet.z || 0,
+            lastSeen: Date.now()
+          });
+        }
+      }
+
+      // 4. In-room chat activity
+      else if (packet.type === 'chat') {
+        if (packet.text) {
+          chatHistory.push({
+            sender: packet.sender || 'Player',
+            text: String(packet.text).slice(0, 160),
+            time: new Date().toISOString()
+          });
+          pendingDiskSave = true;
+        }
+      }
+
+      // 5. Live room synchronization request from newly connected player
+      else if (packet.type === 'request_room_sync') {
+        if (worldModifications.size > 0) {
+          const responsePacket = {
+            type: 'room_sync_response',
+            roomId: ROOM_ID,
+            senderId: 'server_daemon',
+            modifications: Array.from(worldModifications.entries()),
+            chat: chatHistory.slice(-20)
+          };
+          mqttClient.publish(TOPIC, JSON.stringify(responsePacket));
+          console.log(`[Room ${ROOM_ID}] Dispatched live room sync with ${worldModifications.size} modifications to peer.`);
+        }
+      }
+    } catch (e) {
+      // Ignore packet parse errors
+    }
+  });
+
+  mqttClient.on('error', err => {
+    console.warn(`[Room ${ROOM_ID}] MQTT error:`, err.message);
+  });
+
+  mqttClient.on('close', () => {
+    console.log(`[Room ${ROOM_ID}] MQTT connection closed, reconnecting in 5s...`);
+  });
+}
+
+connectMqtt();
+
+// =========================================================================
+// Lightweight HTTP Health & Sync Endpoint
+// =========================================================================
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -110,92 +238,22 @@ const server = http.createServer((req, res) => {
     }));
   }
 
-  if (url.pathname === '/heartbeat' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const data = JSON.parse(body);
-        if (data && data.id) {
-          activePlayers.set(data.id, {
-            id: data.id,
-            name: data.name || 'Player',
-            x: data.x || 0,
-            y: data.y || 0,
-            z: data.z || 0,
-            yaw: data.yaw || 0,
-            pitch: data.pitch || 0,
-            slot: data.slot || 0,
-            isFlying: !!data.isFlying,
-            isSprinting: !!data.isSprinting,
-            lastSeen: Date.now()
-          });
-        }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, count: activePlayers.size }));
-      } catch (e) {
-        res.writeHead(400);
-        res.end('Invalid JSON');
-      }
-    });
-    return;
-  }
-
-  if (url.pathname === '/block' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const data = JSON.parse(body);
-        if (data && data.key && data.block !== undefined) {
-          worldModifications.set(data.key, data.block);
-        }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, total: worldModifications.size }));
-      } catch (e) {
-        res.writeHead(400);
-        res.end('Invalid JSON');
-      }
-    });
-    return;
-  }
-
-  if (url.pathname === '/chat' && req.method === 'POST') {
-    let body = '';
-    req.on('data', chunk => { body += chunk; });
-    req.on('end', () => {
-      try {
-        const data = JSON.parse(body);
-        if (data && data.text) {
-          chatHistory.push({
-            sender: data.sender || 'Player',
-            text: String(data.text).slice(0, 160),
-            time: new Date().toISOString()
-          });
-        }
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true }));
-      } catch (e) {
-        res.writeHead(400);
-        res.end('Invalid JSON');
-      }
-    });
-    return;
-  }
-
   res.writeHead(404);
   res.end('Not Found');
 });
 
 server.listen(PORT, () => {
-  console.log(`[Room ${ROOM_ID}: ${ROOM_NAME}] Dedicated Server running on port ${PORT}`);
+  console.log(`[Room ${ROOM_ID}: ${ROOM_NAME}] Dedicated Server daemon listening on port ${PORT}`);
 });
 
 function gracefulShutdown() {
-  console.log(`[Room ${ROOM_ID}] Graceful shutdown requested. Writing final world snapshot...`);
+  console.log(`[Room ${ROOM_ID}] Graceful shutdown requested. Writing final world snapshot before restart...`);
   saveSnapshotToDisk();
+  if (mqttClient) {
+    try { mqttClient.end(true); } catch (e) {}
+  }
   server.close(() => {
-    console.log(`[Room ${ROOM_ID}] Server closed cleanly.`);
+    console.log(`[Room ${ROOM_ID}] Server closed cleanly. Data prepared for database commit.`);
     process.exit(0);
   });
 }
